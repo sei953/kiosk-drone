@@ -10,7 +10,9 @@
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>px4_msgs</depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
 

@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'aruco_pnp_node = kiosk_vision.aruco_pnp_node:main',
+            'approach_control_node = kiosk_vision.approach_control_node:main',
         ],
     },
 )
