@@ -28,8 +28,12 @@ import cv2
 import numpy as np
 from gz.msgs10.camera_info_pb2 import CameraInfo
 import gz.transport13 as gz_transport
-from mavsdk import System
-from mavsdk.offboard import OffboardError, PositionNedYaw
+# mavsdk is imported lazily inside run() below, not here: compute_mono_pose()
+# (this file's actual reusable payload) is imported by mono_multiview_node.py,
+# a ROS2 node with no mavsdk dependency (px4_msgs covers telemetry there), and
+# `from ... import compute_mono_pose` still executes every top-level import in
+# this file -- a module-level mavsdk import would make the node fail to import
+# in an environment that correctly doesn't have mavsdk installed.
 
 from mono_multiview_capture_and_match import (
     ALT, APPROACH_NORTH, BASELINE_EAST, BASELINE_NORTH, SETTLE_SEC,
@@ -102,11 +106,16 @@ def fit_plane(points):
     """Least-squares plane fit (SVD) to the scaled 3D points -- the kiosk wall
     is assumed planar. Returns (normal, centroid, spread). normal is oriented
     to face back toward the camera (negative Z), matching aruco_pnp_node's
-    board-normal convention so the yaw formula below is directly comparable to
-    its yaw_err. spread is the matched points' bounding-box diagonal [m]: the
-    plane's normal (hence the yaw angle) is only well-constrained if the
-    points span a meaningful area, not a single small cluster -- see
-    SPREAD_MIN_M."""
+    board-normal convention (R @ [0,0,1] in its wall-local frame) so the yaw
+    formula below is directly comparable to its yaw_err_from_R. That formula
+    is atan2(-normal[0], -normal[2]), NOT atan2(normal[0], -normal[2]) --
+    upstream found the un-negated form gives the wrong sign via a real
+    closed-loop check (wall_geometry.py's yaw_err_from_R docstring,
+    docs/PROGRESS.md 2026-09-19); this file used to copy that same wrong
+    convention before being fixed to match. spread is the matched points'
+    bounding-box diagonal [m]: the plane's normal (hence the yaw angle) is
+    only well-constrained if the points span a meaningful area, not a single
+    small cluster -- see SPREAD_MIN_M."""
     centroid = points.mean(axis=0)
     _, _, vh = np.linalg.svd(points - centroid)
     normal = vh[-1]
@@ -204,6 +213,14 @@ def estimate_pose(pts_a, pts_b, K):
     n_front, R, t, pose_mask = cv2.recoverPose(E, inlier_a, inlier_b, K)
     print(f"recoverPose: {n_front} points in front of both cameras "
           f"(t is unit-length: this is the mono scale-ambiguity step 7 fixes)")
+    # n_front IS len(keep) below; checked here (not after triangulating) since
+    # fit_plane's SVD needs at least 3 points and crashes outright (uncaught
+    # ValueError, not SystemExit) on an empty array -- hit live via
+    # mono_multiview_node.py on a real flight: a close/ambiguous cheirality
+    # vote (same failure mode as the lateral_0.6 Essential outlier in
+    # motion_direction_sweep.py) left pose_mask all-False.
+    if n_front < 3:
+        raise SystemExit(f"too few points passed cheirality check ({n_front})")
 
     P0 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
     P1 = K @ np.hstack([R, t])
@@ -275,37 +292,148 @@ def homography_to_metric(R, t_internal, n, inlier_a, K, real_baseline):
     pts3d_internal = s[:, None] * rays  # points on the plane, internal scale
 
     pts3d_m = pts3d_internal[valid] * scale
+    if len(pts3d_m) < 3:
+        # Same class of bug as estimate_pose()'s n_front guard: an empty/tiny
+        # array here crashes outright (uncaught ValueError) a few lines down
+        # at pts3d_m.max/min(axis=0) and .mean(axis=0), instead of failing
+        # cleanly like every other degenerate case in this file.
+        raise SystemExit(f"too few valid homography points on the plane ({len(pts3d_m)})")
 
     n_facing = -n if n[2] > 0 else n
     forward = float(-np.dot(n_facing, pts3d_m.mean(axis=0)))
     lateral, vertical = bbox_center_lateral_vertical(inlier_a[valid], K, n_facing, forward)
-    yaw_deg = float(np.degrees(np.arctan2(n_facing[0], -n_facing[2])))
+    # atan2(-nx, -nz), not atan2(nx, -nz): see the module-level note on
+    # fit_plane() below -- this mirrors wall_geometry.py's yaw_err_from_R,
+    # fixed there against a real closed-loop sign check (docs/PROGRESS.md,
+    # 2026-09-19). The un-negated form is the OLD, wrong convention this file
+    # used to copy.
+    yaw_deg = float(np.degrees(np.arctan2(-n_facing[0], -n_facing[2])))
     spread = float(np.linalg.norm(pts3d_m.max(axis=0) - pts3d_m.min(axis=0)))
-    return forward, lateral, vertical, yaw_deg, spread
+    return forward, lateral, vertical, yaw_deg, spread, n_facing
+
+
+# Homography-primary, Essential-fallback, not a per-frame popularity contest
+# between the two: this project's wall is always planar (kiosk wall), and
+# mono_multiview_motion_direction_sweep.py + mono_multiview_repeat_check.py
+# (vision/mono_multiview/README.md) found Homography stayed accurate
+# (0.30-1.46deg rotation error) across a 3x range of matched-point counts and
+# every pure-lateral/pure-forward direction tried, with exactly one
+# direction-specific outlier (north+0.3/east+0.3, reproducible across 3
+# repeats: 4.08-5.71deg) -- still bounded and far below Essential's own
+# failure mode, a close cheirality-vote tie that produced a 12.26deg miss on
+# a HIGH-inlier-count pure-lateral trial, unrelated to point count. Since
+# Essential is occasionally either much better or much worse than Homography
+# on the same frame pair with no simple predictor, picking "whichever is
+# closer to PX4's attitude this frame" (the previous logic) just lets
+# Essential win sometimes on noise. Defaulting to Homography and only
+# falling back when it fails its OWN sanity check is more predictable.
+HOMOGRAPHY_SANITY_THRESHOLD_DEG = 15.0  # generous vs the observed 0.3-5.7deg
+                                          # range above; only trips for a
+                                          # genuinely bad decomposition, not
+                                          # normal noise.
 
 
 def select_pose(essential, homography, true_cam_rot_deg):
-    """Pick between the Essential Matrix and Homography estimates.
-
-    Both methods recover R for the SAME physical camera motion between frame
-    A and B, so their R's should agree with reality; when one is off, it
-    picked a wrong disambiguation among the up-to-4 candidate solutions. An
-    earlier version of this guessed the true rotation was ~0 (valid only
-    because these test flights command yaw=0.0 throughout). Now we compare
-    each method's self-reported cam_rot against PX4's own IMU-based attitude
-    estimate (quaternion_angle_deg) instead -- real sensor data, not a
-    simulation-only shortcut, so unlike the earlier guess this carries over
-    to production where the drone may genuinely be turning between frames.
+    """Homography-primary: use it unless its own self-reported cam_rot
+    disagrees badly with PX4's real IMU-based attitude estimate
+    (quaternion_angle_deg -- real sensor data, not a simulation-only
+    shortcut, so this carries over to production). That disagreement is a
+    sanity check on Homography, not a contest against Essential -- see the
+    module-level comment above for why treating the two as equal candidates
+    picked per-frame is the wrong model for this planar-scene project.
     """
     agree_deg = rotation_angle_deg(homography["R"] @ essential["R"].T)
     e_err = abs(essential["cam_rot"] - true_cam_rot_deg)
     h_err = abs(homography["cam_rot"] - true_cam_rot_deg)
-    chosen = "Essential" if e_err <= h_err else "Homography"
-    result = essential if chosen == "Essential" else homography
+    if h_err > HOMOGRAPHY_SANITY_THRESHOLD_DEG:
+        chosen, result = "Essential (Homography failed sanity check)", essential
+    else:
+        chosen, result = "Homography", homography
     return chosen, result, agree_deg, e_err, h_err
 
 
+def compute_mono_pose(frame_a, frame_b, quat_a, quat_b, real_baseline, K, verbose=False):
+    """Steps 1-9 (match -> Essential+Homography -> select) as a single call.
+
+    Factored out of run() so mono_multiview_node.py's image callback (and any
+    test harness) calls the exact same, already-validated pipeline instead of
+    duplicating it -- see vision/mono_multiview/README.md for the diagnostic
+    scripts that validated this sequence (sign fix, Homography-primary
+    select_pose, etc.).
+
+    Returns (chosen, result, essential_result, homography_result, extra):
+      - result is the selected dict (forward/lateral/vertical/yaw_deg/spread/
+        cam_rot/method), or None if matching or BOTH pose methods failed.
+      - extra is {'agree_deg', 'e_err', 'h_err'} when both methods produced a
+        result (so select_pose ran), else None (Essential-only fallback, or
+        total failure).
+    """
+    true_cam_rot_deg = quaternion_angle_deg(quat_a, quat_b)
+    log = print if verbose else (lambda *a, **k: None)
+
+    log("-- Steps 1-4: matching frame A/B")
+    try:
+        _, pts_a, pts_b = detect_and_match(frame_a, frame_b)
+    except SystemExit as e:
+        log(f"-- matching FAILED: {e}")
+        return None, None, None, None, None
+
+    log("-- Steps 5-6: Essential Matrix + triangulation (unit scale)")
+    essential_result = None
+    try:
+        R, t_unit, pts3d_unit, inlier_2d_a = estimate_pose(pts_a, pts_b, K)
+        log("-- Step 7: scale correction using PX4 baseline")
+        pts3d_m = pts3d_unit * real_baseline
+        normal, centroid, spread = fit_plane(pts3d_m)
+        forward = float(-np.dot(normal, centroid))
+        lateral, vertical = bbox_center_lateral_vertical(inlier_2d_a, K, normal, forward)
+        # See fit_plane()'s docstring: must be -normal[0], matching
+        # wall_geometry.py's corrected yaw_err_from_R convention.
+        yaw_deg = float(np.degrees(np.arctan2(-normal[0], -normal[2])))
+        cam_rotation_deg = rotation_angle_deg(R)
+        confident = spread >= SPREAD_MIN_M
+        log(f"-- {len(pts3d_m)} scaled 3D points, spread={spread:.3f}m "
+            f"({'CONFIDENT' if confident else f'LOW CONFIDENCE (< {SPREAD_MIN_M}m)'})")
+        log(f"-- ESTIMATED [Essential] forward={forward:.3f}m lateral={lateral:.3f}m "
+            f"vertical={vertical:.3f}m yaw={yaw_deg:+.1f}deg CONFIDENT={confident}")
+        essential_result = {"method": "Essential", "R": R, "normal": normal, "forward": forward,
+                             "lateral": lateral, "vertical": vertical, "yaw_deg": yaw_deg,
+                             "spread": spread, "cam_rot": cam_rotation_deg}
+    except SystemExit as e:
+        log(f"-- Essential pose FAILED: {e}")
+
+    log("-- Alternative: Homography-based pose (planar-scene-specific)")
+    homography_result = None
+    try:
+        R_h, t_h_internal, n_h, inlier_a_h, h_inliers = estimate_pose_homography(pts_a, pts_b, K)
+        h_forward, h_lateral, h_vertical, h_yaw_deg, h_spread, h_normal = homography_to_metric(
+            R_h, t_h_internal, n_h, inlier_a_h, K, real_baseline)
+        h_cam_rotation_deg = rotation_angle_deg(R_h)
+        log(f"-- ESTIMATED [Homography] forward={h_forward:.3f}m lateral={h_lateral:.3f}m "
+            f"vertical={h_vertical:.3f}m yaw={h_yaw_deg:+.1f}deg spread={h_spread:.3f}m "
+            f"cam_rot={h_cam_rotation_deg:.1f}deg")
+        homography_result = {"method": "Homography", "R": R_h, "normal": h_normal, "forward": h_forward,
+                              "lateral": h_lateral, "vertical": h_vertical, "yaw_deg": h_yaw_deg,
+                              "spread": h_spread, "cam_rot": h_cam_rotation_deg}
+    except SystemExit as e:
+        log(f"-- Homography pose FAILED: {e}")
+
+    if essential_result is None and homography_result is None:
+        return None, None, None, None, None
+    if homography_result is None:
+        return "Essential (Homography unavailable)", essential_result, essential_result, None, None
+    if essential_result is None:
+        return "Homography (Essential unavailable)", homography_result, None, homography_result, None
+
+    chosen, result, agree_deg, e_err, h_err = select_pose(
+        essential_result, homography_result, true_cam_rot_deg)
+    extra = {"agree_deg": agree_deg, "e_err": e_err, "h_err": h_err}
+    return chosen, result, essential_result, homography_result, extra
+
+
 async def run(K):
+    from mavsdk import System
+    from mavsdk.offboard import OffboardError, PositionNedYaw
     drone = System()
     await drone.connect(system_address="udp://:14540")
 
@@ -394,68 +522,36 @@ async def run(K):
     # (ours and aruco_pnp's): the wall's world pose is fixed at (0, 3, 1.5) in
     # kiosk.sdf, and PX4's local NED origin is set at the spawn point (no pose
     # override is passed when px4-rc.gzsim spawns the model), which is world
-    # (0, 0, ~). So world_y ~= north_m and the wall-facing distance/lateral
-    # follow directly from PX4's own GPS/IMU position estimate -- no camera
-    # involved at all, so it stays valid even at ranges where both PnP and our
-    # own reconstruction may be degrading.
+    # (0, 0, ~). So world_y ~= north_m and world_x ~= east_m, and the
+    # wall-facing distance/lateral follow directly from PX4's own GPS/IMU
+    # position estimate -- no camera involved at all, so it stays valid even
+    # at ranges where both PnP and our own reconstruction may be degrading.
+    #
+    # lateral here must be wall_east - camera_east, NOT camera_east alone:
+    # both aruco_pnp_node's tvec[0] and our own bbox_center_lateral_vertical()
+    # report the TARGET's position in the camera's own frame (positive =
+    # wall is to the camera's right), which is the geometric NEGATIVE of the
+    # camera's own east offset when the wall sits at east=0 -- moving the
+    # camera east makes the wall appear to its left, not further right. A
+    # sweep across known east offsets (mono_multiview_lateral_bias_sweep.py)
+    # confirmed the estimate tracks -pos_a.east_m, not +pos_a.east_m: this
+    # line was comparing against the wrong sign of ground truth, not a bug in
+    # the estimate itself. geom_forward already got this right (3.0 is the
+    # wall's own north coordinate, subtracted from camera_north the same way).
     geom_forward = 3.0 - pos_a.north_m
-    geom_lateral = pos_a.east_m
+    geom_lateral = 0.0 - pos_a.east_m  # wall world_x=0 (kiosk.sdf) minus camera east
     print(f"-- GEOMETRIC ground truth (from PX4 position + known wall pose, no vision): "
           f"forward={geom_forward:.3f}m lateral={geom_lateral:.3f}m")
 
-    print("-- Steps 1-4: matching frame A/B")
-    _, pts_a, pts_b = detect_and_match(frame_a, frame_b)
-
-    print("-- Steps 5-6: Essential Matrix + triangulation (unit scale)")
-    R, t_unit, pts3d_unit, inlier_2d_a = estimate_pose(pts_a, pts_b, K)
-
-    print("-- Step 7: scale correction using PX4 baseline")
-    pts3d_m = pts3d_unit * real_baseline
-
-    print("-- Fitting wall plane + camera attitude sanity check")
-    normal, centroid, spread = fit_plane(pts3d_m)
-    forward = float(-np.dot(normal, centroid))
-    lateral, vertical = bbox_center_lateral_vertical(inlier_2d_a, K, normal, forward)
-    yaw_deg = float(np.degrees(np.arctan2(normal[0], -normal[2])))
-    cam_rotation_deg = rotation_angle_deg(R)
-    confident = spread >= SPREAD_MIN_M
-
-    print(f"-- {len(pts3d_m)} scaled 3D points, spread={spread:.3f}m "
-          f"({'CONFIDENT' if confident else f'LOW CONFIDENCE (< {SPREAD_MIN_M}m, likely a single-marker cluster)'})")
-    print(f"-- ESTIMATED [Essential] forward={forward:.3f}m lateral={lateral:.3f}m vertical={vertical:.3f}m "
-          f"yaw={yaw_deg:+.1f}deg (camera-A frame, plane-fit) CONFIDENT={confident}")
-    print(f"-- camera attitude sanity check: rotated {cam_rotation_deg:.1f}deg between A and B "
-          f"(commanded yaw=0.0 throughout, so this should be small)")
-    essential_result = {"method": "Essential", "R": R, "forward": forward, "lateral": lateral,
-                         "vertical": vertical, "yaw_deg": yaw_deg, "spread": spread,
-                         "cam_rot": cam_rotation_deg}
-
-    print("-- Alternative: Homography-based pose (planar-scene-specific)")
-    homography_result = None
-    try:
-        R_h, t_h_internal, n_h, inlier_a_h, h_inliers = estimate_pose_homography(pts_a, pts_b, K)
-        h_forward, h_lateral, h_vertical, h_yaw_deg, h_spread = homography_to_metric(
-            R_h, t_h_internal, n_h, inlier_a_h, K, real_baseline)
-        h_cam_rotation_deg = rotation_angle_deg(R_h)
-        print(f"-- ESTIMATED [Homography] forward={h_forward:.3f}m lateral={h_lateral:.3f}m "
-              f"vertical={h_vertical:.3f}m yaw={h_yaw_deg:+.1f}deg spread={h_spread:.3f}m "
-              f"cam_rot={h_cam_rotation_deg:.1f}deg")
-        homography_result = {"method": "Homography", "R": R_h, "forward": h_forward, "lateral": h_lateral,
-                              "vertical": h_vertical, "yaw_deg": h_yaw_deg, "spread": h_spread,
-                              "cam_rot": h_cam_rotation_deg}
-    except SystemExit as e:
-        print(f"-- Homography pose FAILED: {e}")
-
-    print("-- Step 9 (new): auto-selecting between Essential and Homography using PX4 attitude ground truth")
-    if homography_result is None:
-        chosen, result = "Essential", essential_result
-        print("-- Homography unavailable, falling back to Essential")
-    else:
-        chosen, result, agree_deg, e_err, h_err = select_pose(
-            essential_result, homography_result, true_cam_rot_deg)
-        print(f"-- R agreement between methods: {agree_deg:.1f}deg apart")
+    chosen, result, essential_result, homography_result, extra = compute_mono_pose(
+        frame_a, frame_b, quat_a, quat_b, real_baseline, K, verbose=True)
+    if result is None:
+        print("-- Both Essential and Homography FAILED, no pose this pair")
+        return
+    if extra is not None:
+        print(f"-- R agreement between methods: {extra['agree_deg']:.1f}deg apart")
         print(f"-- vs PX4 attitude ({true_cam_rot_deg:.1f}deg): "
-              f"Essential off by {e_err:.1f}deg, Homography off by {h_err:.1f}deg")
+              f"Essential off by {extra['e_err']:.1f}deg, Homography off by {extra['h_err']:.1f}deg")
     print(f"-- SELECTED [{chosen}] forward={result['forward']:.3f}m lateral={result['lateral']:.3f}m "
           f"vertical={result['vertical']:.3f}m yaw={result['yaw_deg']:+.1f}deg")
 

@@ -22,8 +22,13 @@ import cv2
 import numpy as np
 from gz.msgs10.image_pb2 import Image
 import gz.transport13 as gz_transport
-from mavsdk import System
-from mavsdk.offboard import OffboardError, PositionNedYaw
+# mavsdk (System/OffboardError/PositionNedYaw) is imported lazily inside
+# goto()/run() below, not here: this module's detect_and_match()/capture_frame()
+# are reused by mono_multiview_node.py (a ROS2 node with no mavsdk dependency,
+# now that px4_msgs covers telemetry), and `from ... import detect_and_match`
+# still executes every top-level import in this file -- a module-level mavsdk
+# import would make the node fail to import in an environment that correctly
+# doesn't have mavsdk installed.
 
 RGB_TOPIC = "/world/kiosk/model/x500_depth_0/link/camera_link/sensor/IMX214/image"
 OUT_DIR = Path(__file__).resolve().parent.parent.parent / "outputs"
@@ -165,6 +170,7 @@ async def wait_until_stable(drone, target_north, target_east, target_down,
 
 
 async def goto(drone, north, east, yaw, label, hold):
+    from mavsdk.offboard import PositionNedYaw
     print(f"-- {label}")
     await drone.offboard.set_position_ned(PositionNedYaw(north, east, ALT, yaw))
     await asyncio.sleep(1.0)  # let the controller start responding before polling stability
@@ -172,6 +178,8 @@ async def goto(drone, north, east, yaw, label, hold):
 
 
 async def run():
+    from mavsdk import System
+    from mavsdk.offboard import OffboardError, PositionNedYaw
     drone = System()
     await drone.connect(system_address="udp://:14540")
 
