@@ -174,7 +174,16 @@ class MonoMultiviewNode(Node):
         try:
             _, pts_a, pts_b = detect_and_match(self.keyframe['frame'], frame)
         except SystemExit as e:
-            self.get_logger().warn(f'matching failed, keeping keyframe: {e}')
+            # Refresh the keyframe even on failure, not just on success: if
+            # the ORIGINAL keyframe was bad (e.g. captured right at takeoff
+            # before the wall was in view -- zero ORB keypoints, found live
+            # on the markerless mockup wall test), retrying it against every
+            # later frame fails forever and pose never recovers for the rest
+            # of the flight, even once good frames start arriving. A stale
+            # keyframe is strictly worse than a fresh one: worst case, a
+            # fresh keyframe just costs one more baseline-accumulation cycle.
+            self.get_logger().warn(f'matching failed, refreshing keyframe: {e}')
+            self.keyframe = {'frame': frame, 'ned': ned, 'quat': quat}
             self.visible_pub.publish(Bool(data=False))
             return
 
