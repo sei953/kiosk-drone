@@ -93,6 +93,13 @@ PROBE_ROTATE_S = 2.0  # 한 번의 PROBE 사이 회전만 하는 시간 -- 5.0s(
                        # (search_yaw_rate_deg 기본 20도/s 기준)으로 좁혀 커버리지를
                        # 촘촘하게 함 -- 한 바퀴당 정지 지점이 많아지는 대신 한 바퀴
                        # 도는 데 걸리는 시간은 늘어난다(트레이드오프).
+REACQUIRE_SETTLE_S = 2.0  # "마지막 방향 우선 재확인"(phase③) 직전 정지 시간 --
+                           # 실측(2026-10-31): REACQUIRE 스윕 도중 PROBE_ROTATE_S
+                           # (2.0s)만으로는 직전 wiggle 관성이 안 가셔서, 회전
+                           # phase 내내 cur_ned가 명령된 고정 anchor로 수렴하지
+                           # 못하고 계속 흘러감 (그 상태로 바로 PROBE를 쏘면
+                           # 엉뚱한 위치에서 찔러보는 셈). PROBE_ROTATE_S와 같은
+                           # 값으로 시작 -- 더 길게 필요하면 그때 늘릴 것.
 
 # 카메라 마운트고 vs 마커 중심고 (docs/PROGRESS.md 2026-09-22 '카메라 마운트고 정렬' 참고).
 # takeoff_alt 기본값을 이 둘로부터 유도한다 — 비행 고도를 마커 중심고와 그대로 맞추면
@@ -236,6 +243,9 @@ class ApproachControlNode(Node):
         self._probe_center_yaw = None
         self._rotate_label = 'SEARCH'
 
+        # APPROACH/HOLD 상시 dither (_apply_approach_dither)의 phase 시작 시각.
+        self._dither_since = None
+
         self.create_timer(DT, self.on_timer, callback_group=cb_group)
         self.create_timer(SETPOINT_DT, self.on_setpoint_timer, callback_group=cb_group)
         self.get_logger().info(
@@ -353,6 +363,12 @@ class ApproachControlNode(Node):
             target_ned, target_yaw = self.search_ned, self.yaw_ref
         else:
             target_ned, target_yaw = self.run_state_machine(dt)
+            if self.state in ('APPROACH', 'HOLD'):
+                if self._dither_since is None:
+                    self._dither_since = now
+                target_ned = self._apply_approach_dither(target_ned, cur_yaw, now)
+            else:
+                self._dither_since = None
 
         self.target_ned, self.target_yaw = target_ned, target_yaw
 
@@ -392,13 +408,21 @@ class ApproachControlNode(Node):
         if self.offboard_setpoint_counter <= ARM_TICK:
             self.offboard_setpoint_counter += 1
 
-    def _reset_probe_cycle(self):
+    def _reset_probe_cycle(self, start_phase='rotate', probe_center_yaw=None):
         """새로 SEARCH/REACQUIRE-②에 진입할 때 회전<->PROBE phase를 깨끗하게
         초기화 -- 안 그러면 이전 컨텍스트의 남은 phase 타이밍이 새 컨텍스트로
         새어 들어간다 (예: REACQUIRE 스윕 도중 phase가 'probe'였는데 그 직후
-        다시 REACQUIRE에 들어가면 중심 yaw가 엉뚱한 값으로 남아있는 식)."""
-        self._probe_phase = 'rotate'
+        다시 REACQUIRE에 들어가면 중심 yaw가 엉뚱한 값으로 남아있는 식).
+
+        start_phase='settle'은 전체 SEARCH로 승격하는 순간처럼, 방금까지의
+        wiggle 관성이 덜 가신 채로 곧장 새 PROBE를 찌르고 싶지 않을 때 쓴다 --
+        REACQUIRE_SETTLE_S 동안 흔들림 없이 그 자리(anchor 위치+방향)에 멈춰
+        있다가 PROBE로 넘어간다 (_handle_lost phase③ 참고, _rotate_then_probe의
+        'settle' 분기와 짝)."""
+        self._probe_phase = start_phase
         self._probe_phase_since = None
+        if start_phase in ('probe', 'settle'):
+            self._probe_center_yaw = probe_center_yaw
 
     def _rotate_then_probe(self, dt, base_ned, advance_yaw):
         """회전 phase(PROBE_ROTATE_S)와 PROBE phase(PROBE_DURATION_S)를 번갈아
@@ -412,6 +436,19 @@ class ApproachControlNode(Node):
         if self._probe_phase_since is None:
             self._probe_phase_since = now
         elapsed = (now - self._probe_phase_since).nanoseconds * 1e-9
+
+        if self._probe_phase == 'settle':
+            # wiggle 없이 anchor 위치+방향에 가만히 머문다 -- 직전 REACQUIRE
+            # 스윕의 wiggle 관성이 PROBE_ROTATE_S(2.0s)만으로는 덜 가셔서
+            # (실측: 회전 phase 내내 cur_ned가 명령된 고정 anchor로 수렴하지
+            # 못하고 계속 흘러감) "마지막 방향 우선 재확인"이 실제로는 anchor와
+            # 다른 위치에서 이뤄지고 있었다. 이 phase가 끝난 뒤에야 PROBE를
+            # 시작해 진짜 그 자리에서부터 흔든다.
+            self.state = self._rotate_label
+            if elapsed >= REACQUIRE_SETTLE_S:
+                self._probe_phase = 'probe'
+                self._probe_phase_since = now
+            return base_ned, self._probe_center_yaw
 
         if self._probe_phase == 'rotate':
             advance_yaw(dt)
@@ -429,6 +466,38 @@ class ApproachControlNode(Node):
             self._probe_phase = 'rotate'
             self._probe_phase_since = now
         return probe_ned, self._probe_center_yaw
+
+    def _apply_approach_dither(self, target_ned, cur_yaw, now):
+        """APPROACH/HOLD에서도 PROBE와 같은 크기의 lateral wiggle을 상시 깔아둔다.
+
+        mono_multiview(SCRUM-43)는 baseline(실제 이동)이 있어야만 pose를 내는데,
+        APPROACH/HOLD의 보정 이동은 오차가 줄수록 같이 작아지는 자기모순적
+        구조다 -- 정렬이 될수록 baseline도 줄어서, 정작 HOLD 수렴 직전처럼 pose가
+        가장 필요한 순간에 공급이 끊긴다(level 2는 보정 이동 자체가 0이라 더 심함,
+        level 3 실측에서도 APPROACH 진입 후 추가 pose가 전혀 안 들어옴 확인).
+        단안 구조-모션 추정의 persistency of excitation 문헌(곤충의 지그재그
+        비행이 거리 추정에 필요한 이유를 설명하는 결과들)도 동일한 결론 --
+        수렴하며 작아지는 직선성 모션은 scale/depth observability에 최악이고,
+        주기적 모션이 있어야 한다. 보정과는 독립적인(크기가 오차에 안 좌우되는)
+        wiggle을 얹어야 하므로, PROBE_AMPLITUDE_M/PROBE_DURATION_S를 그대로
+        재사용한다 -- 이미 baseline 조건을 만족시키도록 튠된 값이라 새 상수를
+        따로 만들 필요가 없다.
+
+        처음엔 절대시간 기준 사인파로 짰다가 실측으로 깨졌다: APPROACH 진입
+        순간의 절대시간 phase가 임의의 값(예: 거의 극값 반대쪽)이면 목표 위치가
+        그 자리에서 바로 큰 폭으로 점프하고, 그 큰 스텝을 쫓아가는 동안 실제
+        위치는 거의 안 움직였다(한 APPROACH 구간 5틱, ~2.2s 동안 목표 east는
+        -0.33->-0.06m로 흔들렸지만 실제 cur_ned는 0.04m밖에 안 움직임, 그 결과
+        baseline이 전혀 안 쌓여 그 구간 내내 mono_multiview_node 로그가 완전히
+        조용함 -- "매칭 실패"조차 없었다, 즉 baseline 체크 자체를 못 넘었다는 뜻).
+        PROBE(_rotate_then_probe)가 phase 진입 시각부터 0에서 시작하는 것과
+        똑같이, 여기도 APPROACH/HOLD에 들어온 시점(self._dither_since)부터
+        0에서 시작하는 사인파로 바꿔서 — 앵커 위치에서 매끄럽게 벗어나게 한다."""
+        elapsed = (now - self._dither_since).nanoseconds * 1e-9
+        dither = PROBE_AMPLITUDE_M * math.sin(2.0 * math.pi * elapsed / PROBE_DURATION_S)
+        dn = -dither * math.sin(cur_yaw)
+        de = dither * math.cos(cur_yaw)
+        return (target_ned[0] + dn, target_ned[1] + de, target_ned[2])
 
     def _handle_lost(self, dt):
         """타겟 유실 시 곧바로 전체 SEARCH로 튀지 않고 REACQUIRE 3단계를 거친다:
@@ -474,12 +543,36 @@ class ApproachControlNode(Node):
                 self._rotate_label = 'REACQUIRE'
                 return self._rotate_then_probe(dt, self._reacquire_hold_ned, _advance)
 
-            # ③ 좁은 스윕도 실패 -> 전체 SEARCH로 승격
-            self.get_logger().info('REACQUIRE 실패(좁은 스윕 시간초과) -> 전체 SEARCH 회전으로 전환')
+            # ③ 좁은 스윕도 실패 -> 전체 SEARCH로 승격.
+            # 그냥 블라인드로 회전부터 시작하면, 지금 향하고 있는 방향(마지막
+            # 앵커, 가장 최근에 벽을 실제로 봤던 방향)이 PROBE_ROTATE_S(2.0s)
+            # 동안 search_yaw_rate(20deg/s)로 ~40도 멀어진 뒤에야 첫 PROBE를
+            # 찍는다 -- 방금까지 유효했던 방향 정보를 그냥 버리고 가는 셈이다
+            # (실측: 진단용 프레임 캡처로 "too few keypoints" 실패가 전부 벽을
+            # 안 보고 있는 방향에서 났다는 걸 확인 -- 벽이 보이는 각도창 자체가
+            # 좁다는 뜻이므로, 그 창을 떠나기 전에 한 번 더 확인해볼 가치가
+            # 있다). start_phase='settle'로 REACQUIRE_SETTLE_S만큼 그 위치+방향에
+            # 흔들림 없이 멈춰(직전 wiggle 관성을 가라앉히고) PROBE부터 한 번
+            # 찔러보고, 그래도 안 되면 그 다음부터 기존처럼 회전해서 넓게 훑는다.
+            self.get_logger().info('REACQUIRE 실패(좁은 스윕 시간초과) -> 전체 SEARCH 회전으로 전환 (마지막 방향 우선 재확인)')
             self.state = 'SEARCH'
-            self.yaw_ref = self.target_yaw
+            # self.target_yaw가 아니라 self._reacquire_center_yaw를 써야 한다 --
+            # self.target_yaw는 방금까지 돌던 phase②(좁은 스윕)가 타임아웃
+            # 직전에 멈춘 "현재 스윕 위치"로 계속 갱신돼 있어서, lock을 놓쳤을
+            # 때의 진짜 원래 방향이 아니다(실측: ~37도씩 벗어나 있었음, 딱
+            # 스윕 범위만큼 -- 그래서 "우선 재확인"이 매번 엉뚱한 곳을 찔러보고
+            # 있었다). _reacquire_center_yaw는 REACQUIRE 진입 시 한 번만
+            # 고정되는 진짜 anchor 방향이다.
+            self.yaw_ref = self._reacquire_center_yaw
+            # 아래 return문은 항상 self.search_ned를 base_ned로 써서 회전/PROBE를
+            # 내보낸다 -- 지금 추가하는 settle/probe도 예외가 아니므로, anchor
+            # 위치(_reacquire_hold_ned)를 search_ned에 그대로 옮겨 써야 "마지막
+            # 방향"뿐 아니라 "마지막 위치"에서도 정지+재확인이 이뤄진다. 미션
+            # 시작 때의 옛 위치보다 지금 이 anchor가 더 최신/정확한 기준점이기도
+            # 하다.
+            self.search_ned = self._reacquire_hold_ned
             self._reacquire_since = None  # SEARCH로 넘어왔으니 REACQUIRE 타이머는 더 이상 무의미
-            self._reset_probe_cycle()
+            self._reset_probe_cycle(start_phase='settle', probe_center_yaw=self._reacquire_center_yaw)
 
         def _advance_search(dt_):
             self.yaw_ref = wrap_pi(self.yaw_ref + self.search_yaw_rate * dt_)
