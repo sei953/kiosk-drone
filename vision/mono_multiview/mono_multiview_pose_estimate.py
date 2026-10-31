@@ -341,14 +341,26 @@ def select_pose(essential, homography, true_cam_rot_deg):
     sanity check on Homography, not a contest against Essential -- see the
     module-level comment above for why treating the two as equal candidates
     picked per-frame is the wrong model for this planar-scene project.
+
+    The Essential fallback got the same sanity check only after a live
+    closed-loop run (SCRUM-43) got derailed by it: Homography failed its
+    check (h_err=34.3) so Essential was used unconditionally, but Essential's
+    own disagreement with ground truth was just as bad (e_err=33.9) -- a
+    near-90deg-off first lock the control loop then spent the rest of the
+    run failing to recover from. Falling back blindly assumed "the other
+    method" was inherently more trustworthy, which isn't true; both get held
+    to the same bar now, and a frame where neither clears it is reported as
+    no result rather than as a confident-looking but wrong pose.
     """
     agree_deg = rotation_angle_deg(homography["R"] @ essential["R"].T)
     e_err = abs(essential["cam_rot"] - true_cam_rot_deg)
     h_err = abs(homography["cam_rot"] - true_cam_rot_deg)
-    if h_err > HOMOGRAPHY_SANITY_THRESHOLD_DEG:
+    if h_err <= HOMOGRAPHY_SANITY_THRESHOLD_DEG:
+        chosen, result = "Homography", homography
+    elif e_err <= HOMOGRAPHY_SANITY_THRESHOLD_DEG:
         chosen, result = "Essential (Homography failed sanity check)", essential
     else:
-        chosen, result = "Homography", homography
+        chosen, result = "both failed sanity check", None
     return chosen, result, agree_deg, e_err, h_err
 
 
