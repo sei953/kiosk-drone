@@ -38,12 +38,15 @@ pose를 내기 시작한다. 이동이 부족하면 pose 없이 visible=False만
 계산하게 된다. 그런데 이미지 header.stamp는 Gazebo 시뮬레이션 시각(초 단위,
 0부터 시작)이고 px4_msgs의 timestamp 필드는 실제 wall-clock epoch(마이크로초)
 라서 -- 직접 비교가 불가능한 서로 다른 시계다 (실측 확인: 같은 순간에
-header.stamp=25.3, px4 timestamp=1791173357.5). 그래서 최초 프레임에서 한 번
-"sim_time + offset = wall_time" 오프셋을 보정해두고, 이후 모든 프레임은 그
-오프셋으로 추정한 실제 촬영 시각에 가장 가까운 텔레메트리 샘플을 버퍼에서
-찾아 쓴다 (_nearest_sample). offset 보정은 lockstep의 real_time_factor=1.0을
-전제하므로, 시뮬레이션이 그 비율에서 크게 벗어나면(렌더링 과부하 등) 오차가
-누적될 수 있다 -- 짧은 비행(검증 스크립트 기준 수십 초~수 분)에서는 충분.
+header.stamp=25.3, px4 timestamp=1791173357.5). 그래서 "sim_time + offset =
+wall_time" 오프셋을 OFFSET_RESYNC_S마다 다시 재보정해두고, 매 프레임은 그
+시점 기준 오프셋으로 추정한 실제 촬영 시각에 가장 가까운 텔레메트리 샘플을
+버퍼에서 찾아 쓴다 (_nearest_sample). 최초 1회만 보정하던 버전은 lockstep의
+real_time_factor=1.0 가정이 실측(2026-11-09)에서 깨지는 걸 확인-- WSL 렌더링
+부하로 sim 시각이 실제 시각보다 훨씬 느리게 흘러서(2초 동안 sim은 0.1~0.2초만
+진행) offset이 시간이 갈수록 계속 벌어지고, 결국 추정 촬영 시각이 텔레메트리
+버퍼 범위 밖으로 완전히 밀려나 pose가 몇 분씩 전혀 안 나오는 현상으로 이어짐
+(on_image 참고). 주기적 재보정으로 drift가 한 주기 이상 누적되지 않게 막는다.
 """
 
 import sys
@@ -112,6 +115,10 @@ _PX4_QOS = QoSProfile(
 
 _TELEMETRY_BUFFER_LEN = 50  # 텔레메트리는 ned/attitude 합쳐 초당 수십~수백 Hz라
                              # 50개면 보통 초 단위 이하 구간을 커버한다.
+
+OFFSET_RESYNC_S = 2.0  # sim_to_wall 오프셋 재보정 주기 (on_image 참고) --
+                        # 텔레메트리 버퍼가 커버하는 시간 범위보다 짧게 잡아야
+                        # 한 주기 안에 쌓이는 drift가 버퍼 밖으로 안 밀려난다.
 
 
 def _nearest_sample(buffer, target_wall_time):
@@ -227,7 +234,8 @@ class MonoMultiviewNode(Node):
         # "시간 동기화" 참고). ned=(north_m,east_m,down_m), quat=_Quat.
         self._ned_buffer = deque(maxlen=_TELEMETRY_BUFFER_LEN)
         self._quat_buffer = deque(maxlen=_TELEMETRY_BUFFER_LEN)
-        self._sim_to_wall_offset = None  # 최초 프레임에서 한 번만 보정
+        self._sim_to_wall_offset = None  # OFFSET_RESYNC_S마다 재보정 (on_image)
+        self._offset_calibrated_at = None  # 마지막 재보정 wall-time
         self._pose_filter = _PoseFilter()
 
         self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
@@ -263,11 +271,28 @@ class MonoMultiviewNode(Node):
 
         image_sim_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         now_wall = self.get_clock().now().nanoseconds * 1e-9
-        if self._sim_to_wall_offset is None:
-            # 최초 프레임을 기준점으로 삼아 sim_time -> wall_time 오프셋을 한 번
-            # 보정한다 (모듈 docstring의 "시간 동기화" 참고). 그 뒤로는 이
-            # 오프셋으로 매 프레임의 추정 촬영 시각(wall-clock)을 구한다.
+        if (self._sim_to_wall_offset is None
+                or (now_wall - self._offset_calibrated_at) >= OFFSET_RESYNC_S):
+            # sim_time -> wall_time 오프셋을 주기적으로(OFFSET_RESYNC_S마다)
+            # 다시 잰다 (모듈 docstring의 "시간 동기화" 참고). 최초 1회만
+            # 보정하던 버전은 실측(2026-11-09, run12/13)에서 깨짐 -- lockstep의
+            # real_time_factor=1.0 가정이 실제로는 WSL 렌더링 부하로 크게
+            # 무너져서(관측: 실제 2초 동안 sim 시각은 0.1~0.2초밖에 안 감,
+            # factor~0.05-0.1) 오프셋이 시간이 갈수록 계속 벌어졌다. 그 결과
+            # estimated_capture_wall_time이 텔레메트리 버퍼(최근 1~5초 분량)
+            # 범위 밖으로 완전히 밀려나서, nearest_sample이 매번 버퍼 끝
+            # 샘플만 집는 바람에 baseline이 실제 이동과 무관해지고 pose가
+            # 몇 분씩 전혀 안 나오는 현상으로 이어졌다(로그에 "매칭 실패"
+            # 조차 안 남는 완전한 침묵 -- baseline 체크 이전 단계에서부터
+            # 막혔던 것). 매번 다시 재는 게 아니라 주기적으로만 재보정하는
+            # 이유는, 매 프레임마다 재면 어차피 now_wall과 똑같아져서(offset
+            # = now_wall - image_sim_time, 그대로 더하면 now_wall) 애초에
+            # offset을 쓰는 의미(콜백 실행 시점 자체의 지연 보정)가 없어지기
+            # 때문 -- OFFSET_RESYNC_S 동안만 고정해두면 그 창 안에서는 여전히
+            # sim_time 기반 추정이 유효하면서, drift가 쌓이기 전에 주기적으로
+            # 초기화된다.
             self._sim_to_wall_offset = now_wall - image_sim_time
+            self._offset_calibrated_at = now_wall
         estimated_capture_wall_time = image_sim_time + self._sim_to_wall_offset
 
         ned = _nearest_sample(self._ned_buffer, estimated_capture_wall_time)
