@@ -351,13 +351,28 @@ def select_pose(essential, homography, true_cam_rot_deg):
     method" was inherently more trustworthy, which isn't true; both get held
     to the same bar now, and a frame where neither clears it is reported as
     no result rather than as a confident-looking but wrong pose.
+
+    e_err/h_err only catch a bad ROTATION -- a live FULL-approach run
+    (2026-11-10) diverged because a frame passed with e_err=2.7 (rotation
+    looked great) while its forward/lateral translation was nonsense
+    (fwd=0.14m, lat=+1.75m near a 1.0m standoff), driving the anchor ~2m off
+    in one update; the existing temporal outlier filter's OUTLIER_DIST_M(3.0)
+    didn't catch a jump that size either. The accepted candidate's own
+    SPREAD_MIN_M check (fit_plane()'s point-cloud extent -- already computed,
+    only ever used for a log line) is a second, independent signal: a bad
+    translation/scale is usually downstream of a poorly-conditioned
+    triangulation (points too clustered to reliably separate forward from
+    lateral), so requiring both rotation AND spread to clear the bar catches
+    cases good rotation alone misses.
     """
     agree_deg = rotation_angle_deg(homography["R"] @ essential["R"].T)
     e_err = abs(essential["cam_rot"] - true_cam_rot_deg)
     h_err = abs(homography["cam_rot"] - true_cam_rot_deg)
-    if h_err <= HOMOGRAPHY_SANITY_THRESHOLD_DEG:
+    h_ok = h_err <= HOMOGRAPHY_SANITY_THRESHOLD_DEG and homography["spread"] >= SPREAD_MIN_M
+    e_ok = e_err <= HOMOGRAPHY_SANITY_THRESHOLD_DEG and essential["spread"] >= SPREAD_MIN_M
+    if h_ok:
         chosen, result = "Homography", homography
-    elif e_err <= HOMOGRAPHY_SANITY_THRESHOLD_DEG:
+    elif e_ok:
         chosen, result = "Essential (Homography failed sanity check)", essential
     else:
         chosen, result = "both failed sanity check", None
@@ -432,9 +447,16 @@ def compute_mono_pose(frame_a, frame_b, quat_a, quat_b, real_baseline, K, verbos
 
     if essential_result is None and homography_result is None:
         return None, None, None, None, None
+    # 한쪽만 나온 경우는 select_pose를 안 거치므로 회전 sanity check 자체가
+    # 없다 -- 그래도 spread는 동일하게 걸러야 한다(select_pose 쪽 docstring의
+    # "회전은 멀쩡해도 거리/스케일이 틀릴 수 있다" 문제가 여기도 똑같이 적용됨).
     if homography_result is None:
+        if essential_result["spread"] < SPREAD_MIN_M:
+            return "Essential low confidence (spread, Homography unavailable)", None, essential_result, None, None
         return "Essential (Homography unavailable)", essential_result, essential_result, None, None
     if essential_result is None:
+        if homography_result["spread"] < SPREAD_MIN_M:
+            return "Homography low confidence (spread, Essential unavailable)", None, None, homography_result, None
         return "Homography (Essential unavailable)", homography_result, None, homography_result, None
 
     chosen, result, agree_deg, e_err, h_err = select_pose(

@@ -366,6 +366,11 @@ class MonoMultiviewNode(Node):
                 self.get_logger().warn(
                     f'pose rejected: both Essential and Homography failed sanity check '
                     f'(e_err={extra["e_err"]:.1f} h_err={extra["h_err"]:.1f}) -- treating as not visible')
+            elif chosen is not None:
+                # 한쪽만 나왔는데 spread(점군 퍼짐)가 너무 작아 거부된 경우 --
+                # chosen 문자열에 어느 쪽인지 이미 담겨 있다 (compute_mono_pose
+                # 참고).
+                self.get_logger().warn(f'pose rejected: {chosen} -- treating as not visible')
             else:
                 self.get_logger().warn('Essential and Homography both failed for this pair')
             self.visible_pub.publish(Bool(data=False))
